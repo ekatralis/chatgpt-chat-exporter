@@ -3,124 +3,144 @@
         return date.toISOString().split('T')[0];
     }
 
-  function cleanMarkdown(text) {
-    const mathBlocks = [];
+    function isDisplayMath(node, latex = '') {
+    // 1) MathJax v3: <mjx-container display="true|false">
+    if ((node.tagName || '').toLowerCase() === 'mjx-container') {
+        const d = node.getAttribute('display');
+        if (d != null) {
+        const v = d.toLowerCase();
+        return v === 'true' || v === 'block' || v === '1';
+        }
+    }
+
+    // 2) If we're inside display mjx-container
+    if (node.closest && node.closest('mjx-container[display="true"], mjx-container[display="block"], mjx-container[display="1"]')) {
+        return true;
+    }
+
+    // 3) KaTeX display wrapper
+    if (node.closest && node.closest('.katex-display')) return true;
+
+    // 4) Common display wrappers
+    if (node.closest && node.closest('[data-math-display="true"], .math-display, .MathJax_Display')) return true;
+
+    // 5) TeX content fallback
+    const t = (latex || '').trim();
+    if (
+        /\\begin\{[^}]+\}/.test(t) ||
+        /\\\\/.test(t) ||
+        /(^|[^\\])&/.test(t) ||
+        /\\(tag|label|cases|align|gather|multline)\b/.test(t)
+    ) return true;
+
+    return false;
+    }
+
+    function cleanMarkdown(text) {
+        const mathBlocks = [];
+        let i = 0;
+
+        // Protect $$...$$ and $...$
+        text = text.replace(
+            /\$\$[\s\S]*?\$\$|\$(?:\\.|[^\$\\])+\$/g,
+            match => {
+            const key = `@@MATH_${i++}@@`;
+            mathBlocks.push(match);
+            return key;
+            }
+        );
+
+        // Normal escaping (NON-math content only)
+        text = text
+            // Escape backslashes not already escaping markdown
+            .replace(/\\(?![\\*_`])/g, '\\\\')
+            .replace(/\n{3,}/g, '\n\n')
+            .replace(/&lt;/g, '<')
+            .replace(/&gt;/g, '>')
+            .replace(/&amp;/g, '&');
+
+        // Restore math blocks untouched
+        mathBlocks.forEach((block, idx) => {
+            text = text.replace(`@@MATH_${idx}@@`, block);
+        });
+
+        return text;
+    }
+
+
+    function replaceMathJaxWithTokens(root) {
+    const mathReplacements = [];
     let i = 0;
 
-    // Protect $$...$$ and $...$
-    text = text.replace(
-        /\$\$[\s\S]*?\$\$|\$(?:\\.|[^\$\\])+\$/g,
-        match => {
-        const key = `@@MATH_${i++}@@`;
-        mathBlocks.push(match);
-        return key;
-        }
-    );
-
-    // Normal escaping (NON-math content only)
-    text = text
-        // Escape backslashes not already escaping markdown
-        .replace(/\\(?![\\*_`])/g, '\\\\')
-        .replace(/\n{3,}/g, '\n\n')
-        .replace(/&lt;/g, '<')
-        .replace(/&gt;/g, '>')
-        .replace(/&amp;/g, '&');
-
-    // Restore math blocks untouched
-    mathBlocks.forEach((block, idx) => {
-        text = text.replace(`@@MATH_${idx}@@`, block);
-    });
-
-    return text;
-  }
-
-
-  // --- NEW: MathJax -> $...$ / $$...$$ ---
-  function replaceMathJaxWithDollars(root) {
-    // Try to extract TeX/LaTeX from a node in a few common ways
     function extractLatex(node) {
-      // 1) data-latex / data-tex attributes (some renderers)
-      const attr =
+        const attr =
         node.getAttribute?.('data-latex') ||
         node.getAttribute?.('data-tex') ||
         node.getAttribute?.('aria-label');
 
-      if (attr && attr.trim()) return attr.trim();
+        if (attr && attr.trim()) return attr.trim();
 
-      // 2) MathJax v3 sometimes stores original TeX in <annotation encoding="application/x-tex">
-      const ann = node.querySelector?.('annotation[encoding="application/x-tex"]');
-      if (ann && ann.textContent.trim()) return ann.textContent.trim();
+        const ann = node.querySelector?.('annotation[encoding="application/x-tex"]');
+        if (ann && ann.textContent.trim()) return ann.textContent.trim();
 
-      // 3) Fallback: text content (less ideal but better than losing it)
-      const txt = node.textContent || '';
-      return txt.replace(/\s+/g, ' ').trim();
+        // last resort
+        return (node.textContent || '').replace(/\s+/g, ' ').trim();
     }
 
-    // Decide inline vs display
-    function isDisplayMath(node) {
-      // MathJax v3: <mjx-container display="true">
-      const mjxDisplay = node.getAttribute?.('display');
-      if (mjxDisplay) return mjxDisplay === 'true';
-
-      // KaTeX often uses .katex-display; some MathJax wrappers use .math-display
-      const cls = (node.className || '').toString();
-      if (cls.includes('katex-display') || cls.includes('math-display')) return true;
-
-      // If it's in a block-ish wrapper, treat as display
-      const tag = (node.tagName || '').toUpperCase();
-      if (tag === 'DIV' || tag === 'P' || tag === 'CENTER') {
-        // heuristic: lots of display math nodes are block containers
-        // but don’t force it if it’s tiny inline math in a div
-        const textLen = (node.textContent || '').trim().length;
-        if (textLen > 0 && textLen < 80) return false;
-        return true;
-      }
-
-      return false;
-    }
-
-    // Collect candidates (MathJax v3 + a couple of common fallbacks)
     const candidates = root.querySelectorAll(
-      [
-        'mjx-container',                 // MathJax v3
-        '[data-latex]',                  // custom attrs
+        [
+        'mjx-container',
+        '[data-latex]',
         '[data-tex]',
-        '.katex',                        // if KaTeX appears too
-        '.mathjax', '.MathJax'           // older wrappers
-      ].join(',')
+        '.katex',
+        '.mathjax', '.MathJax'
+        ].join(',')
     );
 
     candidates.forEach(node => {
-      // Avoid double-processing nested structures (e.g., .katex inside a wrapper)
-      // Prefer the outermost math node in any subtree.
-      const parentIsMath = node.parentElement && (
+        // avoid processing nested math nodes
+        const parentIsMath = node.parentElement && (
         node.parentElement.matches?.('mjx-container,[data-latex],[data-tex],.katex,.mathjax,.MathJax')
-      );
-      if (parentIsMath) return;
+        );
+        if (parentIsMath) return;
 
-      const latex = extractLatex(node);
-      if (!latex) return;
+        const latex = extractLatex(node);
+        if (!latex) return;
 
-      const display = isDisplayMath(node);
+        const display = isDisplayMath(node, latex);
+        const token = `@@MATH_${i++}@@`;
 
-      // Wrap with single/double dollars
-      // Ensure we don't introduce trailing spaces weirdness
-      const wrapped = display ? `\n\n$$\n${latex}\n$$\n\n` : `$${latex}$`;
+        mathReplacements.push({ token, latex, display });
 
-      node.parentNode.replaceChild(document.createTextNode(wrapped), node);
+        node.parentNode.replaceChild(document.createTextNode(token), node);
     });
-  }
 
-  function processMessageContent(element) {
+    return mathReplacements;
+    }
+
+    function injectMathFromTokens(text, mathReplacements) {
+    let out = text;
+
+    for (const { token, latex, display } of mathReplacements) {
+        const replacement = display
+        ? `\n\n$$\n${latex}\n$$\n\n`
+        : `$${latex}$`;
+
+        out = out.split(token).join(replacement);
+    }
+
+    return out;
+    }
+
+
+    function processMessageContent(element) {
     const clone = element.cloneNode(true);
 
-    // Remove UI elements that shouldn't be in the export
-    clone
-      .querySelectorAll('button, svg, [class*="copy"], [class*="edit"], [class*="regenerate"]')
-      .forEach(el => el.remove());
+    clone.querySelectorAll('button, svg, [class*="copy"], [class*="edit"], [class*="regenerate"]')
+        .forEach(el => el.remove());
 
-    // NEW: convert MathJax to $...$ / $$...$$ BEFORE flattening text
-    replaceMathJaxWithDollars(clone);
+    // NEW: convert math nodes into tokens, store replacements
+    const mathReplacements = replaceMathJaxWithTokens(clone);
 
     // Replace <pre><code> blocks with proper markdown
     clone.querySelectorAll('pre').forEach(pre => {
@@ -158,9 +178,14 @@
       link.parentNode.replaceChild(document.createTextNode(markdown), link);
     });
 
-    // Convert remaining HTML to clean markdown text
-    return cleanMarkdown(clone.innerText.trim());
-  }
+      // Flatten HTML to text
+    let text = clone.innerText.trim();
+
+    // Restore tokens -> $...$ / $$...$$ (this is where dollars are guaranteed to survive)
+    text = injectMathFromTokens(text, mathReplacements);
+
+    return cleanMarkdown(text);
+    }
 
     function findMessages() {
         // More specific selectors to avoid nested elements
