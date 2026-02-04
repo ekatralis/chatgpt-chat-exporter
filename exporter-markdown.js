@@ -3,60 +3,164 @@
         return date.toISOString().split('T')[0];
     }
 
-    function cleanMarkdown(text) {
-        return text
-            // Only escape backslashes that aren't already escaping something
-            .replace(/\\(?![\\*_`])/g, '\\\\')
-            // Clean up excessive newlines
-            .replace(/\n{3,}/g, '\n\n')
-            // Remove any HTML entities that might have leaked through
-            .replace(/&lt;/g, '<')
-            .replace(/&gt;/g, '>')
-            .replace(/&amp;/g, '&');
+  function cleanMarkdown(text) {
+    const mathBlocks = [];
+    let i = 0;
+
+    // Protect $$...$$ and $...$
+    text = text.replace(
+        /\$\$[\s\S]*?\$\$|\$(?:\\.|[^\$\\])+\$/g,
+        match => {
+        const key = `@@MATH_${i++}@@`;
+        mathBlocks.push(match);
+        return key;
+        }
+    );
+
+    // Normal escaping (NON-math content only)
+    text = text
+        // Escape backslashes not already escaping markdown
+        .replace(/\\(?![\\*_`])/g, '\\\\')
+        .replace(/\n{3,}/g, '\n\n')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&amp;/g, '&');
+
+    // Restore math blocks untouched
+    mathBlocks.forEach((block, idx) => {
+        text = text.replace(`@@MATH_${idx}@@`, block);
+    });
+
+    return text;
+  }
+
+
+  // --- NEW: MathJax -> $...$ / $$...$$ ---
+  function replaceMathJaxWithDollars(root) {
+    // Try to extract TeX/LaTeX from a node in a few common ways
+    function extractLatex(node) {
+      // 1) data-latex / data-tex attributes (some renderers)
+      const attr =
+        node.getAttribute?.('data-latex') ||
+        node.getAttribute?.('data-tex') ||
+        node.getAttribute?.('aria-label');
+
+      if (attr && attr.trim()) return attr.trim();
+
+      // 2) MathJax v3 sometimes stores original TeX in <annotation encoding="application/x-tex">
+      const ann = node.querySelector?.('annotation[encoding="application/x-tex"]');
+      if (ann && ann.textContent.trim()) return ann.textContent.trim();
+
+      // 3) Fallback: text content (less ideal but better than losing it)
+      const txt = node.textContent || '';
+      return txt.replace(/\s+/g, ' ').trim();
     }
 
-    function processMessageContent(element) {
-        const clone = element.cloneNode(true);
+    // Decide inline vs display
+    function isDisplayMath(node) {
+      // MathJax v3: <mjx-container display="true">
+      const mjxDisplay = node.getAttribute?.('display');
+      if (mjxDisplay) return mjxDisplay === 'true';
 
-        // Remove UI elements that shouldn't be in the export
-        clone.querySelectorAll('button, svg, [class*="copy"], [class*="edit"], [class*="regenerate"]').forEach(el => el.remove());
+      // KaTeX often uses .katex-display; some MathJax wrappers use .math-display
+      const cls = (node.className || '').toString();
+      if (cls.includes('katex-display') || cls.includes('math-display')) return true;
 
-        // Replace <pre><code> blocks with proper markdown
-        clone.querySelectorAll('pre').forEach(pre => {
-            const code = pre.innerText.trim();
-            const langMatch = pre.querySelector('code')?.className?.match(/language-([a-zA-Z0-9]+)/);
-            const lang = langMatch ? langMatch[1] : '';
-            const codeBlock = document.createTextNode(`\n\n\`\`\`${lang}\n${code}\n\`\`\`\n`);
-            pre.parentNode.replaceChild(codeBlock, pre);
-        });
+      // If it's in a block-ish wrapper, treat as display
+      const tag = (node.tagName || '').toUpperCase();
+      if (tag === 'DIV' || tag === 'P' || tag === 'CENTER') {
+        // heuristic: lots of display math nodes are block containers
+        // but don’t force it if it’s tiny inline math in a div
+        const textLen = (node.textContent || '').trim().length;
+        if (textLen > 0 && textLen < 80) return false;
+        return true;
+      }
 
-        // Replace images and canvas with placeholders
-        clone.querySelectorAll('img, canvas').forEach(el => {
-            const placeholder = document.createTextNode('[Image or Canvas]');
-            el.parentNode.replaceChild(placeholder, el);
-        });
-
-        // Convert links (including reference chips) into Markdown format
-        clone.querySelectorAll('a[href]').forEach(link => {
-            if (link.closest('pre, code')) return;
-
-            const href = (link.href || '').trim();
-            const lowerHref = href.toLowerCase();
-            if (!href || lowerHref.startsWith('javascript:') || lowerHref.startsWith('data:') || lowerHref.startsWith('vbscript:') || href.startsWith('#')) return;
-
-            const text = link.textContent.replace(/\s+/g, ' ').trim() || href;
-            const escapedText = text
-                .replace(/\\/g, '\\\\')
-                .replace(/([\[\]])/g, '\\$1');
-            const safeHref = href
-                .replace(/\\/g, '%5C')
-                .replace(/\)/g, '%29');
-            const markdown = `[${escapedText}](${safeHref})`;
-            link.parentNode.replaceChild(document.createTextNode(markdown), link);
-        });
-        // Convert remaining HTML to clean markdown text
-        return cleanMarkdown(clone.innerText.trim());
+      return false;
     }
+
+    // Collect candidates (MathJax v3 + a couple of common fallbacks)
+    const candidates = root.querySelectorAll(
+      [
+        'mjx-container',                 // MathJax v3
+        '[data-latex]',                  // custom attrs
+        '[data-tex]',
+        '.katex',                        // if KaTeX appears too
+        '.mathjax', '.MathJax'           // older wrappers
+      ].join(',')
+    );
+
+    candidates.forEach(node => {
+      // Avoid double-processing nested structures (e.g., .katex inside a wrapper)
+      // Prefer the outermost math node in any subtree.
+      const parentIsMath = node.parentElement && (
+        node.parentElement.matches?.('mjx-container,[data-latex],[data-tex],.katex,.mathjax,.MathJax')
+      );
+      if (parentIsMath) return;
+
+      const latex = extractLatex(node);
+      if (!latex) return;
+
+      const display = isDisplayMath(node);
+
+      // Wrap with single/double dollars
+      // Ensure we don't introduce trailing spaces weirdness
+      const wrapped = display ? `\n\n$$\n${latex}\n$$\n\n` : `$${latex}$`;
+
+      node.parentNode.replaceChild(document.createTextNode(wrapped), node);
+    });
+  }
+
+  function processMessageContent(element) {
+    const clone = element.cloneNode(true);
+
+    // Remove UI elements that shouldn't be in the export
+    clone
+      .querySelectorAll('button, svg, [class*="copy"], [class*="edit"], [class*="regenerate"]')
+      .forEach(el => el.remove());
+
+    // NEW: convert MathJax to $...$ / $$...$$ BEFORE flattening text
+    replaceMathJaxWithDollars(clone);
+
+    // Replace <pre><code> blocks with proper markdown
+    clone.querySelectorAll('pre').forEach(pre => {
+      const code = pre.innerText.trim();
+      const langMatch = pre.querySelector('code')?.className?.match(/language-([a-zA-Z0-9]+)/);
+      const lang = langMatch ? langMatch[1] : '';
+      const codeBlock = document.createTextNode(`\n\n\`\`\`${lang}\n${code}\n\`\`\`\n`);
+      pre.parentNode.replaceChild(codeBlock, pre);
+    });
+
+    // Replace images and canvas with placeholders
+    clone.querySelectorAll('img, canvas').forEach(el => {
+      const placeholder = document.createTextNode('[Image or Canvas]');
+      el.parentNode.replaceChild(placeholder, el);
+    });
+
+    // Convert links (including reference chips) into Markdown format
+    clone.querySelectorAll('a[href]').forEach(link => {
+      if (link.closest('pre, code')) return;
+
+      const href = (link.href || '').trim();
+      const lowerHref = href.toLowerCase();
+      if (
+        !href ||
+        lowerHref.startsWith('javascript:') ||
+        lowerHref.startsWith('data:') ||
+        lowerHref.startsWith('vbscript:') ||
+        href.startsWith('#')
+      ) return;
+
+      const text = link.textContent.replace(/\s+/g, ' ').trim() || href;
+      const escapedText = text.replace(/\\/g, '\\\\').replace(/([\[\]])/g, '\\$1');
+      const safeHref = href.replace(/\\/g, '%5C').replace(/\)/g, '%29');
+      const markdown = `[${escapedText}](${safeHref})`;
+      link.parentNode.replaceChild(document.createTextNode(markdown), link);
+    });
+
+    // Convert remaining HTML to clean markdown text
+    return cleanMarkdown(clone.innerText.trim());
+  }
 
     function findMessages() {
         // More specific selectors to avoid nested elements
