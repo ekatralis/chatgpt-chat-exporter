@@ -4,7 +4,18 @@
     }
 
     function isDisplayMath(node, latex = '') {
-    // 1) MathJax v3: <mjx-container display="true|false">
+    // KaTeX: the authoritative signal is MathML's <math display="block">
+    // Your snippet shows this exactly.
+    const mathEl =
+        node.querySelector?.('.katex-mathml math') ||
+        node.querySelector?.('math');
+
+    if (mathEl) {
+        const disp = mathEl.getAttribute('display');
+        if (disp && disp.toLowerCase() === 'block') return true;
+    }
+
+    // MathJax v3: <mjx-container display="true|false">
     if ((node.tagName || '').toLowerCase() === 'mjx-container') {
         const d = node.getAttribute('display');
         if (d != null) {
@@ -13,24 +24,17 @@
         }
     }
 
-    // 2) If we're inside display mjx-container
+    // If inside display mjx-container
     if (node.closest && node.closest('mjx-container[display="true"], mjx-container[display="block"], mjx-container[display="1"]')) {
         return true;
     }
 
-    // 3) KaTeX display wrapper
-    if (node.closest && node.closest('.katex-display')) return true;
-
-    // 4) Common display wrappers
-    if (node.closest && node.closest('[data-math-display="true"], .math-display, .MathJax_Display')) return true;
-
-    // 5) TeX content fallback
+    // Fallback: TeX patterns that are almost always display
     const t = (latex || '').trim();
     if (
         /\\begin\{[^}]+\}/.test(t) ||
         /\\\\/.test(t) ||
-        /(^|[^\\])&/.test(t) ||
-        /\\(tag|label|cases|align|gather|multline)\b/.test(t)
+        /(^|[^\\])&/.test(t)
     ) return true;
 
     return false;
@@ -103,6 +107,11 @@
         node.parentElement.matches?.('mjx-container,[data-latex],[data-tex],.katex,.mathjax,.MathJax')
         );
         if (parentIsMath) return;
+
+        if (node.closest && node.closest('.katex') && !(node.classList && node.classList.contains('katex'))) {
+            return;
+        }
+
 
         const latex = extractLatex(node);
         if (!latex) return;
